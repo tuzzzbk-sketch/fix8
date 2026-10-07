@@ -248,7 +248,15 @@ def analyze(log):
             elif pending_epilog and line.strip():
                 result['passed'] = line.strip() == 'Passed'
                 pending_epilog = False
-            if re.search(r'\bUVM_(?:ERROR|FATAL)\b(?!\s*:\s*0\s*$)|Error-|M1DE_BUILD_TIMEOUT|M1DE_BUILD_LOG_LIMIT', line):
+            # SVT prints demoted/caught report counters before the UVM totals.
+            # Only exact, zero-valued counter lines are harmless; actual reports
+            # and nonzero counters must still fail even if final totals are zero.
+            uvm_counter = re.fullmatch(
+                r'\s*(?:UVM_(?:ERROR|FATAL)|Number of (?:demoted|caught) '
+                r'UVM_(?:ERROR|FATAL) reports)\s*:\s*(\d+)\s*', line)
+            if (uvm_counter and int(uvm_counter[1]) != 0) or (
+                    not uvm_counter and re.search(r'\bUVM_(?:ERROR|FATAL)\b', line)) or re.search(
+                    r'Error-|M1DE_BUILD_TIMEOUT|M1DE_BUILD_LOG_LIMIT', line):
                 result['errors'] = True
             for key in ('uvm_error', 'uvm_fatal'):
                 count = re.match(r'\s*' + key.upper() + r'\s*:\s*(\d+)\s*$', line)
@@ -475,6 +483,24 @@ def self_test():
         assert smoke_ok(analyze(log)) and bp_ok(analyze(log))
         log.write_text(log_fixture(False))
         assert smoke_ok(analyze(log)) and not bp_ok(analyze(log))
+        counters = ''.join('Number of %s UVM_%s reports : 0\n' % (kind, severity)
+                           for kind in ('demoted', 'caught')
+                           for severity in ('FATAL', 'ERROR', 'WARNING'))
+        log.write_text(counters + log_fixture(False))
+        parsed = analyze(log)
+        assert not parsed['errors'] and smoke_ok(parsed) and not bp_ok(parsed)
+        log.write_text(counters + log_fixture())
+        assert bp_ok(analyze(log))
+        for bad_report in ('UVM_ERROR file.sv(578) @ 265000000: env [RETRY] overflow\n',
+                           'UVM_FATAL @ 10: reporter [FAIL] failure\n',
+                           'Number of caught UVM_ERROR reports : 1\n',
+                           'Number of demoted UVM_FATAL reports : 1\n',
+                           'Number of caught UVM_ERROR reports : unknown\n',
+                           'UVM_ERROR : 1\n', 'Error-[SE] Syntax error\n',
+                           'M1DE_BUILD_TIMEOUT\n'):
+            # An earlier failure cannot be erased by later zero-valued totals.
+            log.write_text(bad_report + counters + log_fixture())
+            assert analyze(log)['errors'] and not smoke_ok(analyze(log))
         for text in (log_fixture() + 'UVM_ERROR bad\n',
                      log_fixture().replace('violations=0', 'violations=1'),
                      log_fixture().replace('accepted=40', 'accepted=39'),
