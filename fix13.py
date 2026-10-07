@@ -234,12 +234,14 @@ def patch(target, dry_run=False, undo=False):
 
 def analyze(log):
     result = {'passed': False, 'errors': False, 'uvm_error': None, 'uvm_fatal': None,
-              'rc': None, 'e2e': None, 'shadow': None, 'covers': {}, 'api': set(),
+              'rc': None, 'e2e': None, 'shadow': None, 'covers': {}, 'api': set(), 'seeds': set(),
               'tail': deque(maxlen=35)}
     pending_epilog = False
     notable = re.compile(r'M1DE_BP13|UCIE_E2E_SUMMARY|UCIE_INT_SHADOW_SUMMARY|SvtTestEpilog|UVM_(?:ERROR|FATAL)|Error-|M1DE_BUILD_|m1de_sva_(?:ds|us)\.c_')
     with log.open(errors='replace') as source:
         for line in source:
+            for seed in re.findall(r'(?:^|\s)\+ntb_random_seed=(\d+)(?=\s|$)', line):
+                result['seeds'].add(int(seed))
             if notable.search(line) or pending_epilog:
                 result['tail'].append(line.rstrip())
             if 'SvtTestEpilog:' in line:
@@ -299,7 +301,11 @@ def bp_ok(r):
                     for role in ('ds', 'us')))
 
 
-def summary(log):
+def seed_ok(r, expected_seed):
+    return expected_seed is None or r['seeds'] == {expected_seed}
+
+
+def summary(log, expected_seed=None):
     r = analyze(log)
     print('LOG:', log)
     for line in r['tail']:
@@ -307,9 +313,13 @@ def summary(log):
     print('SMOKE_GATE:', 'PASS' if smoke_ok(r) else 'INCOMPLETE_OR_FAIL')
     for role in ('ds', 'us'):
         print('STALL_COVER_%s:' % role.upper(), r['covers'].get((role, 'c_tx_stall_then_accept')))
-    print('BACKPRESSURE_GATE:', 'PASS_THIS_RUN' if bp_ok(r) else 'NOT_QUALIFIED')
+    if expected_seed is not None:
+        print('SEED_GATE: requested=%d observed=%s %s' %
+              (expected_seed, sorted(r['seeds']), 'PASS' if seed_ok(r, expected_seed) else 'FAIL'))
+    qualified = bp_ok(r) and seed_ok(r, expected_seed)
+    print('BACKPRESSURE_GATE:', 'PASS_THIS_RUN' if qualified else 'NOT_QUALIFIED')
     print('NOTE: this gate covers this Streaming/F2 Stack0 FDI64 run only.')
-    return bp_ok(r)
+    return qualified
 
 
 def preflight(project, topology, vendor_root):
@@ -356,7 +366,7 @@ def stop_process(proc):
     proc.wait()
 
 
-def build(project, topology, target, log, timeout=600, max_log_mb=128, poll=30):
+def build(project, topology, target, log, timeout=600, max_log_mb=128, poll=30, seed=None):
     if edited(target.read_text())[1]:
         raise ValueError('Apply fix13 before --build')
     if not shutil.which('gmake'):
@@ -364,6 +374,9 @@ def build(project, topology, target, log, timeout=600, max_log_mb=128, poll=30):
     command = ['gmake', '-B', fix10.TEST, 'USE_SIMULATOR=vcsvlog',
                'SVT_UCIE_COMPILE_FILE=' + fix10.FILELIST,
                'SVT_UCIE_TOPOLOGY_FILE=' + fix10.NAME]
+    if seed is not None:
+        command.append('SEED=' + str(seed))
+        print('REQUESTED_SEED:', seed, flush=True)
     print('BUILD_CWD:', topology.parent, flush=True)
     print('LOG:', log, flush=True)
     with log.open('xb') as out:
@@ -392,7 +405,7 @@ def build(project, topology, target, log, timeout=600, max_log_mb=128, poll=30):
             raise
         out.write(('\nM1DE_BUILD_EXIT rc=%d\n' % code).encode())
     print('BUILD_EXIT: rc=%d; simulation/SVA gate follows' % code, flush=True)
-    passed = summary(log)
+    passed = summary(log, seed)
     return (0 if passed else 2) if code == 0 else (code if code > 0 else 128 - code)
 
 
@@ -481,6 +494,14 @@ def self_test():
         log = root / 'synthetic.log'
         log.write_text(log_fixture())
         assert smoke_ok(analyze(log)) and bp_ok(analyze(log))
+        for seed_line, expected in (
+                ('./output/simvcsvlog +ntb_random_seed=51 -l ./logs/simulate.log run\n', True),
+                ('./output/simvcsvlog +ntb_random_seed=50 run\n', False),
+                ('', False),
+                ('./output/simvcsvlog +ntb_random_seed=51 +ntb_random_seed=50 run\n', False),
+                ('M1DE_REQUESTED_SEED=51\n', False)):
+            log.write_text(seed_line + log_fixture())
+            assert seed_ok(analyze(log), 51) == expected
         log.write_text(log_fixture(False))
         assert smoke_ok(analyze(log)) and not bp_ok(analyze(log))
         counters = ''.join('Number of %s UVM_%s reports : 0\n' % (kind, severity)
@@ -525,9 +546,10 @@ def self_test():
         try:
             os.environ['PATH'] = str(bin_dir) + os.pathsep + old_path
             build_log = root / 'build.log'
-            assert build(root, topology, target, build_log, poll=0.05) == 3
+            assert build(root, topology, target, build_log, poll=0.05, seed=51) == 3
             saved = build_log.read_bytes()
             assert str(root).encode() in saved and b'M1DE_BUILD_EXIT rc=3' in saved
+            assert b'SEED=51' in saved
             for value in (fix10.TEST, fix10.FILELIST, fix10.NAME):
                 assert value.encode() in saved
             try:
@@ -550,7 +572,8 @@ def main():
     for flag in ('build', 'summary', 'undo', 'dry-run', 'self-test'):
         mode.add_argument('--' + flag, action='store_true')
     parser.add_argument('--vendor-root', default=os.environ.get('DIR_VIP', VENDOR_DEFAULT))
-    parser.add_argument('--log-name', default='compile_pipe_debug13.log')
+    parser.add_argument('--log-name', default=None)
+    parser.add_argument('--seed', type=int, help='Pass SEED to gmake and verify the simulation seed')
     parser.add_argument('--timeout', type=int, default=600)
     parser.add_argument('--max-log-mb', type=int, default=128)
     args = parser.parse_args()
@@ -559,6 +582,11 @@ def main():
             self_test()
         print('SELF_TEST_PASS: patch/undo guards, bounded process cleanup, streaming result gates; no VCS validation')
         return 0
+    if args.seed is not None and (not (args.build or args.summary) or not 1 <= args.seed <= 2147483647):
+        raise ValueError('--seed requires --build/--summary and an integer from 1 to 2147483647')
+    if args.log_name is None:
+        args.log_name = ('compile_pipe_debug13_seed%d.log' % args.seed
+                         if args.seed is not None else 'compile_pipe_debug13.log')
     if not re.fullmatch(r'compile_pipe_debug13(?:_[A-Za-z0-9-]+)?\.log', args.log_name):
         raise ValueError('Log name must be compile_pipe_debug13[_suffix].log')
     if args.timeout < 30 or args.max_log_mb < 1:
@@ -568,13 +596,13 @@ def main():
     target = project / TEST_REL
     log = project / 'logs' / args.log_name
     if args.summary:
-        return 0 if summary(log) else 2
+        return 0 if summary(log, args.seed) else 2
     if args.undo:
         patch(target, undo=True)
         return 0
     preflight(project, topology, Path(args.vendor_root))
     if args.build:
-        return build(project, topology, target, log, args.timeout, args.max_log_mb)
+        return build(project, topology, target, log, args.timeout, args.max_log_mb, seed=args.seed)
     patch(target, dry_run=args.dry_run)
     return 0
 
